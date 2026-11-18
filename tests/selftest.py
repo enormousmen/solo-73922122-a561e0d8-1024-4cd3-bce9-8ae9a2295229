@@ -16,7 +16,8 @@ def check(name, ok, detail=""):
     print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
 
 
-PENDING_RESULTS = {"shadow_pending", "shadow_completed_primary_incomplete", "pending"}
+PENDING_RESULTS = {"shadow_pending", "shadow_completed_primary_incomplete",
+                   "pending", "shadow_terminating"}
 
 
 async def wait_record(s, gw, marker, timeout_s=5.0):
@@ -29,6 +30,23 @@ async def wait_record(s, gw, marker, timeout_s=5.0):
             return hit[0]
         await asyncio.sleep(0.15)
     raise AssertionError(f"terminal record with {marker} not found")
+
+
+async def wait_pending_record(s, gw, marker, timeout_s=5.0):
+    """按 marker 轮询等待记录出现且影子仍在途(shadow_pending)后返回。"""
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        recs = await (await s.get(f"{gw}/api/records")).json()
+        hit = [x for x in recs if marker in x["target"]]
+        if hit and hit[0]["result"] == "shadow_pending":
+            return hit[0]
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"pending record with {marker} not found")
+
+
+async def terminate(s, gw, rid):
+    async with s.post(f"{gw}/api/records/{rid}/terminate-shadow") as r:
+        return r.status, await r.json()
 
 
 async def main():
@@ -133,6 +151,163 @@ async def main():
         check("7 断连结果标记", disc and disc[0]["result"] == "client_disconnected",
               disc[0]["result"] if disc else "")
         check("7 断连后影子名额归零", state["shadow_in_flight"] == 0,
+              str(state["shadow_in_flight"]))
+
+        # 8. 终止影子: 主端已送达(自定义207)、影子在途 -> 受理后先终止中,
+        #    通信退出后记已终止并归还名额; 主响应状态码/字节不受影响
+        url = f"{GW}/quote?s_delay=5&status=207&marker={run_id}-t8"
+        async with s.get(url) as r:
+            body8 = await r.read()
+            gw_status8 = r.status
+        check("8 主响应保持原状态码207", gw_status8 == 207, str(gw_status8))
+        rec = await wait_pending_record(s, GW, f"marker={run_id}-t8")
+        rid8 = rec["id"]
+        code, resp = await terminate(s, GW, rid8)
+        check("8 终止被受理(先终止中)",
+              code == 200 and resp.get("accepted") is True
+              and resp.get("status") == "terminating", f"{code} {resp}")
+        rec = await wait_record(s, GW, f"marker={run_id}-t8")
+        check("8 通信退出后记已终止", rec["result"] == "shadow_terminated",
+              rec["result"])
+        check("8 不完整影子未报一致", rec["result"] != "match"
+              and "shadow_sha256" not in rec)
+        check("8 记录保留主端原状态码", rec.get("primary_status") == 207)
+        check("8 记录主端摘要=客户端实收",
+              rec.get("primary_sha256") == hashlib.sha256(body8).hexdigest())
+        state = await (await s.get(f"{GW}/api/state")).json()
+        check("8 名额已归还", state["shadow_in_flight"] == 0,
+              str(state["shadow_in_flight"]))
+
+        # 9. 重复终止: 已终止后再次操作只返回当前状态, 不改变结论
+        code, resp = await terminate(s, GW, rid8)
+        check("9 重复终止返回当前状态",
+              code == 200 and resp.get("accepted") is False
+              and resp.get("result") == "shadow_terminated", f"{code} {resp}")
+        rec = await wait_record(s, GW, f"marker={run_id}-t8")
+        check("9 结论未被改写", rec["result"] == "shadow_terminated", rec["result"])
+        code, _ = await terminate(s, GW, "r-nonexistent-0")
+        check("9 未知记录返回404", code == 404, str(code))
+
+        # 10. 完整结束先定稿: match 记录拒绝终止并保留原结论
+        async with s.get(f"{GW}/quote?marker={run_id}-t10") as r:
+            await r.read()
+        rec = await wait_record(s, GW, f"marker={run_id}-t10")
+        check("10 前置为 match", rec["result"] == "match", rec["result"])
+        code, resp = await terminate(s, GW, rec["id"])
+        check("10 已定稿记录拒绝终止",
+              code == 200 and resp.get("accepted") is False
+              and resp.get("result") == "match", f"{code} {resp}")
+        rec = await wait_record(s, GW, f"marker={run_id}-t10")
+        check("10 原结论保留", rec["result"] == "match", rec["result"])
+
+        # 11. 2s 超时先定稿: shadow_timeout 记录拒绝终止并保留原结论
+        async with s.get(f"{GW}/quote?s_delay=3&marker={run_id}-t11") as r:
+            await r.read()
+        rec = await wait_record(s, GW, f"marker={run_id}-t11")
+        check("11 前置为 shadow_timeout", rec["result"] == "shadow_timeout",
+              rec["result"])
+        code, resp = await terminate(s, GW, rec["id"])
+        check("11 超时定稿后终止返回当前状态",
+              code == 200 and resp.get("accepted") is False
+              and resp.get("result") == "shadow_timeout", f"{code} {resp}")
+        rec = await wait_record(s, GW, f"marker={run_id}-t11")
+        check("11 原结论保留", rec["result"] == "shadow_timeout", rec["result"])
+
+        # 12. 终止腾出容量: 4 个慢影子占满名额 -> 第5个跳过 ->
+        #     终止全部 -> 名额归还(不多不少) -> 后续报价影子恢复
+        async def slow(i):
+            async with aiohttp.ClientSession() as cs:
+                async with cs.get(
+                        f"{GW}/quote?s_delay=5&marker={run_id}-t12-{i}") as r:
+                    await r.read()
+        await asyncio.gather(*(slow(i) for i in range(4)))
+        pend = []
+        for _ in range(40):
+            recs = await (await s.get(f"{GW}/api/records")).json()
+            pend = [x for x in recs if f"marker={run_id}-t12-" in x["target"]
+                    and x["result"] == "shadow_pending"]
+            if len(pend) == 4:
+                break
+            await asyncio.sleep(0.05)
+        check("12 四条待定记录在途", len(pend) == 4, str(len(pend)))
+        state = await (await s.get(f"{GW}/api/state")).json()
+        check("12 名额占满", state["shadow_in_flight"] == 4,
+              str(state["shadow_in_flight"]))
+        async with s.get(f"{GW}/quote?marker={run_id}-t12-extra") as r:
+            await r.read()
+        rec = await wait_record(s, GW, f"marker={run_id}-t12-extra")
+        check("12 满额时后续请求跳过影子",
+              rec["result"] == "shadow_skipped_no_slot", rec["result"])
+        for x in pend:
+            code, resp = await terminate(s, GW, x["id"])
+            check("12 终止被受理", code == 200 and resp.get("accepted") is True,
+                  f"{code} {resp}")
+        finals = []
+        for _ in range(40):
+            recs = await (await s.get(f"{GW}/api/records")).json()
+            finals = [x for x in recs if f"marker={run_id}-t12-" in x["target"]
+                      and "extra" not in x["target"]]
+            if all(x["result"] == "shadow_terminated" for x in finals) \
+                    and len(finals) == 4:
+                break
+            await asyncio.sleep(0.05)
+        check("12 四条全部记为已终止",
+              len(finals) == 4
+              and all(x["result"] == "shadow_terminated" for x in finals),
+              str([x["result"] for x in finals]))
+        state = await (await s.get(f"{GW}/api/state")).json()
+        check("12 名额恰好归零(不重复释放)", state["shadow_in_flight"] == 0,
+              str(state["shadow_in_flight"]))
+        async with s.get(f"{GW}/quote?marker={run_id}-t12-after") as r:
+            await r.read()
+        rec = await wait_record(s, GW, f"marker={run_id}-t12-after")
+        check("12 终止后后续报价影子恢复", rec["result"] == "match", rec["result"])
+        state = await (await s.get(f"{GW}/api/state")).json()
+        check("12 容量仍为4", state["shadow_capacity"] == 4,
+              str(state["shadow_capacity"]))
+
+        # 13. 终止中重复操作: 第二次只回报当前状态, 最终仍已终止, 名额不重复释放
+        async with s.get(f"{GW}/quote?s_delay=5&marker={run_id}-t13") as r:
+            await r.read()
+        rec = await wait_pending_record(s, GW, f"marker={run_id}-t13")
+        code1, resp1 = await terminate(s, GW, rec["id"])
+        code2, resp2 = await terminate(s, GW, rec["id"])  # 紧跟着重复操作
+        ok_second = (resp2.get("status") == "terminating"
+                     and resp2.get("accepted") is True) or \
+                    (resp2.get("accepted") is False
+                     and resp2.get("result") in ("shadow_terminating",
+                                                 "shadow_terminated"))
+        check("13 终止中重复操作返回当前状态", code2 == 200 and ok_second,
+              f"{code2} {resp2}")
+        rec = await wait_record(s, GW, f"marker={run_id}-t13")
+        check("13 最终记为已终止", rec["result"] == "shadow_terminated",
+              rec["result"])
+        state = await (await s.get(f"{GW}/api/state")).json()
+        check("13 名额恰好归还一次", state["shadow_in_flight"] == 0,
+              str(state["shadow_in_flight"]))
+
+        # 14. 终止 vs 2s 超时交错: 在超时边界两侧(1.95s/2.05s)发起终止,
+        #     结论必须恰为 已终止/超时 之一, 绝不为一致, 名额最终归零
+        race_results = []
+        for i in range(10):
+            t0 = time.monotonic()
+            async with s.get(f"{GW}/quote?s_delay=5&marker={run_id}-t14-{i}") as r:
+                await r.read()
+            rec = await wait_pending_record(s, GW, f"marker={run_id}-t14-{i}")
+            target = 1.95 if i % 2 == 0 else 2.05
+            remain = target - (time.monotonic() - t0)
+            if remain > 0:
+                await asyncio.sleep(remain)
+            await terminate(s, GW, rec["id"])
+        for i in range(10):
+            rec = await wait_record(s, GW, f"marker={run_id}-t14-{i}")
+            race_results.append(rec["result"])
+        check("14 交错结论恰为已终止或超时",
+              all(x in ("shadow_terminated", "shadow_timeout")
+                  for x in race_results), str(race_results))
+        check("14 交错中无不完整影子报一致", "match" not in race_results)
+        state = await (await s.get(f"{GW}/api/state")).json()
+        check("14 交错后名额归零", state["shadow_in_flight"] == 0,
               str(state["shadow_in_flight"]))
 
     print(f"\n汇总: {len(PASS)} passed, {len(FAIL)} failed")

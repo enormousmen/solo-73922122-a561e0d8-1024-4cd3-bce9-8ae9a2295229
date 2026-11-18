@@ -7,12 +7,15 @@
 - 两端各自流式计算 SHA-256, 两端都完整结束才比较状态码与摘要
 - 最多 4 个影子并发, 名额满时跳过影子并注明原因, 主请求照常通过
 - 客户端断连同时终止两端; 影子通信实际退出后才归还名额
+- 值班员可对在途影子执行"终止影子": 先记终止中, 通信实际退出才记已终止并归还名额;
+  已完整结束/已超时定稿的记录保留原结论, 重复终止只返回当前状态
 - 不整份缓存/落盘响应, 每块读取后立即更新哈希并释放
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import logging
 import os
 import resource
@@ -22,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import aiohttp
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -44,8 +47,11 @@ HOP_BY_HOP = {
 TERMINAL_RESULTS = {
     "match", "mismatch", "shadow_timeout", "shadow_error",
     "client_disconnected", "primary_error", "primary_incomplete",
-    "shadow_skipped_no_slot",
+    "shadow_skipped_no_slot", "shadow_terminated",
 }
+# finalize 不得触碰的状态: 终态 + "终止中"过渡态
+# (终止已被受理但影子通信尚未退出, 若此时主端收口, 不得改写为 pending 或比较结论)
+FINALIZE_FROZEN = TERMINAL_RESULTS | {"shadow_terminating"}
 
 
 @dataclass
@@ -63,8 +69,15 @@ class ShadowLimiter:
             return True
 
     async def release(self) -> None:
-        async with self.lock:
+        # 名额必须归还且只还一次。计数增减在单事件循环内本身是原子的,
+        # 锁只用于 acquire 的占位判断; 若在等锁期间被取消(未持有锁),
+        # 直接补偿归还, 保证任何交错下名额不丢、不重。
+        try:
+            async with self.lock:
+                self.in_flight -= 1
+        except asyncio.CancelledError:
             self.in_flight -= 1
+            raise
 
 
 @dataclass
@@ -75,6 +88,8 @@ class CallContext:
     primary_done: bool = False
     shadow_done: bool = False
     saved: bool = False
+    # 值班员已请求终止影子(终止已受理, 等待影子通信实际退出)
+    terminate_requested: bool = False
     record: Optional[dict] = None
     shadow_task: Optional[asyncio.Task] = None
 
@@ -83,6 +98,8 @@ state: dict = {}
 # 后台影子任务的强引用集合: 防止生成器返回后 ctx 被回收导致任务被 GC 销毁,
 # 任务完成时通过 done_callback 自行移除
 background_tasks: set[asyncio.Task] = set()
+# 请求 id 单调计数: 保证 rid 在进程内唯一, 终止操作不会命中错误请求
+_rid_counter = itertools.count(1)
 
 
 @asynccontextmanager
@@ -94,6 +111,9 @@ async def lifespan(app: FastAPI):
     state["limiter"] = ShadowLimiter()
     state["records"] = []
     state["records_lock"] = asyncio.Lock()
+    # rid -> CallContext: 影子通信在途期间的登记表, 供"终止影子"定位;
+    # 影子任务退出时自行注销
+    state["contexts"] = {}
     try:
         yield
     finally:
@@ -119,6 +139,18 @@ def filtered_headers(resp: aiohttp.ClientResponse) -> dict[str, str]:
     return {k: v for k, v in resp.headers.items() if k.lower() not in HOP_BY_HOP}
 
 
+def _mark_terminated(rec: dict) -> None:
+    """终止请求已被受理后, 影子通信实际退出时的统一落态。"""
+    rec["result"] = "shadow_terminated"
+    rec["shadow"] = "terminated by operator"
+    rec["detail"] = "shadow terminated by operator; slot released"
+
+
+def _terminate_preempts(rec: dict, ctx: CallContext) -> bool:
+    """终止已受理(终止中)时, 影子以任何方式退出都记为已终止, 不覆盖终止结论。"""
+    return ctx.terminate_requested or rec["result"] == "shadow_terminating"
+
+
 async def run_shadow(ctx: CallContext) -> None:
     """
     执行一次影子调用 (从发起起整体 2s 硬超时)。
@@ -139,22 +171,37 @@ async def run_shadow(ctx: CallContext) -> None:
                     shadow_hash.update(chunk)  # 流式哈希, 不缓存整份响应
                 shadow_digest = shadow_hash.hexdigest()
         except asyncio.TimeoutError:
-            rec["result"] = "shadow_timeout"
-            rec["shadow"] = f"timeout after {SHADOW_TIMEOUT_S:g}s"
+            if _terminate_preempts(rec, ctx):
+                # 终止先被受理, 超时与取消同时到达: 记已终止
+                _mark_terminated(rec)
+            else:
+                rec["result"] = "shadow_timeout"
+                rec["shadow"] = f"timeout after {SHADOW_TIMEOUT_S:g}s"
             return
         except asyncio.CancelledError:
-            # 客户端断连或主端失败: 影子随主端一起终止
-            rec["result"] = "client_disconnected"
-            rec["shadow"] = "cancelled with primary"
+            if _terminate_preempts(rec, ctx):
+                # 值班员终止: 取消已送达, 影子通信实际退出
+                _mark_terminated(rec)
+            elif rec["result"] not in TERMINAL_RESULTS:
+                # 客户端断连或主端失败: 影子随主端一起终止;
+                # 主端已定性(primary_error 等)时保留原结论
+                rec["result"] = "client_disconnected"
+                rec["shadow"] = "cancelled with primary"
             raise
         except aiohttp.ClientError as exc:
-            rec["result"] = "shadow_error"
-            rec["shadow"] = f"connection error: {type(exc).__name__}"
+            if _terminate_preempts(rec, ctx):
+                _mark_terminated(rec)
+            else:
+                rec["result"] = "shadow_error"
+                rec["shadow"] = f"connection error: {type(exc).__name__}"
             return
         except Exception as exc:  # 防御: 影子侧任何意外都不能拖垮主流程
             logging.getLogger("shadow").exception("shadow task failed: %r", exc)
-            rec["result"] = "shadow_error"
-            rec["shadow"] = f"unexpected error: {type(exc).__name__}: {exc}"
+            if _terminate_preempts(rec, ctx):
+                _mark_terminated(rec)
+            else:
+                rec["result"] = "shadow_error"
+                rec["shadow"] = f"unexpected error: {type(exc).__name__}: {exc}"
             return
 
         rec["shadow_status"] = shadow_status
@@ -170,16 +217,24 @@ async def run_shadow(ctx: CallContext) -> None:
         _compare(rec)
     finally:
         ctx.shadow_done = True
-        if acquired:
-            # 通信实际退出(含超时/取消)后才归还名额
-            await state["limiter"].release()
-        if not ctx.primary_done:
-            # 主端未完整(客户端断连/主端失败): 记录由主端生命周期保存
-            return
-        # 主端已完整: 影子在此收口, 把最终结果写回已落库的记录(原地更新)
-        finalize(rec, ctx)
-        if not ctx.saved:
-            await save_record(ctx)
+        try:
+            if acquired:
+                # 通信实际退出(含超时/取消)后才归还名额; 即使在收尾阶段
+                # 再次被取消, limiter 内也会补偿归还, 保证名额不丢不重
+                try:
+                    await state["limiter"].release()
+                except asyncio.CancelledError:
+                    pass
+            if not ctx.primary_done:
+                # 主端未完整(客户端断连/主端失败): 记录由主端生命周期保存
+                return
+            # 主端已完整: 影子在此收口, 把最终结果写回已落库的记录(原地更新)
+            finalize(rec, ctx)
+            if not ctx.saved:
+                await save_record(ctx)
+        finally:
+            # 影子通信已退出: 从登记表注销(此后再有终止请求只回报当前状态)
+            state["contexts"].pop(ctx.rid, None)
 
 
 def _compare(rec: dict) -> None:
@@ -201,8 +256,8 @@ def _compare(rec: dict) -> None:
 
 def finalize(rec: dict, ctx: CallContext) -> None:
     """主端完整结束后的统一收口: 补算比较结果。"""
-    # 终态(断连/超时/失败等)不得被覆盖
-    if rec["result"] in TERMINAL_RESULTS:
+    # 终态(断连/超时/失败/已终止等)与终止中过渡态均不得被覆盖
+    if rec["result"] in FINALIZE_FROZEN:
         return
     if not ctx.shadow_done:
         # 影子仍在跑(受 2s 硬超时保护): 先挂起, 等其退出时再更新,
@@ -227,7 +282,7 @@ async def save_record(ctx: CallContext) -> None:
 
 
 async def proxy(request: Request, target: str) -> StreamingResponse:
-    rid = f"r{now_ms()}-{id(request) % 100000:05d}"
+    rid = f"r{now_ms()}-{next(_rid_counter)}"
     started = now_ms()
     rec: dict = {
         "id": rid,
@@ -246,6 +301,8 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
         ctx.shadow_task = task
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
+        # 登记在途上下文, 供"终止影子"按 rid 定位; 影子退出时自行注销
+        state["contexts"][rid] = ctx
     else:
         rec["shadow"] = "skipped"
         rec["result"] = "shadow_skipped_no_slot"
@@ -258,7 +315,9 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
         primary_resp = await session.get(PRIMARY_URL + target, allow_redirects=False)
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         rec["primary"] = f"connection error: {type(exc).__name__}"
-        rec["result"] = "primary_error"
+        if rec["result"] not in FINALIZE_FROZEN:
+            # 终止已受理时结论归终止流程所有, 不覆盖
+            rec["result"] = "primary_error"
         if ctx.shadow_task is not None:
             # 主端连接失败: 终止已发起的影子; 名额由任务自身在退出时归还
             ctx.shadow_task.cancel()
@@ -283,7 +342,8 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
         except asyncio.CancelledError:
             # 客户端断连: 同时终止主端读取与影子调用
             rec["primary"] = "aborted before completion"
-            rec["result"] = "client_disconnected"
+            if rec["result"] not in FINALIZE_FROZEN:
+                rec["result"] = "client_disconnected"
             primary_resp.release()
             if ctx.shadow_task is not None and not ctx.shadow_task.done():
                 ctx.shadow_task.cancel()
@@ -298,7 +358,8 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
         except aiohttp.ClientError as exc:
             # 主端传输中途断开: 主响应不完整, 同样终止影子
             rec["primary"] = f"stream error: {type(exc).__name__}"
-            rec["result"] = "primary_incomplete"
+            if rec["result"] not in FINALIZE_FROZEN:
+                rec["result"] = "primary_incomplete"
             primary_resp.release()
             if ctx.shadow_task is not None and not ctx.shadow_task.done():
                 ctx.shadow_task.cancel()
@@ -364,6 +425,57 @@ async def get_state():
         "records": len(state["records"]),
         "max_rss_mib": round(rss_kb / 1024, 2),
     }
+
+
+async def find_record(rid: str) -> Optional[dict]:
+    async with state["records_lock"]:
+        for rec in state["records"]:
+            if rec["id"] == rid:
+                return rec
+    return None
+
+
+@app.post("/api/records/{rid}/terminate-shadow")
+async def terminate_shadow(rid: str):
+    """
+    终止指定记录的在途影子调用 (值班员操作):
+    - 影子在途: 受理后立即置为"终止中"并取消影子任务; 主响应与其他请求不受影响。
+      影子通信实际退出时才记为"已终止"并归还名额(由影子任务自身完成)。
+    - 影子已完整结束/已超时/已终止等已定性的记录: 保留原结论, 幂等返回当前状态。
+    判定与落态之间没有任何 await, 与影子任务的同步段互斥, 保证
+    "终止受理"与"影子定稿"两者必居其一, 不会互相覆盖。
+    """
+    ctx = state["contexts"].get(rid)
+    if ctx is None:
+        # 影子通信已退出(或从未发起): 从记录里回报当前状态, 幂等
+        rec = await find_record(rid)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="record not found")
+        return {"id": rid, "accepted": False, "status": "current",
+                "result": rec["result"]}
+
+    # ---- 关键判定区: 无 await, 对影子任务同步段原子 ----
+    rec = ctx.record
+    result = rec["result"]
+    if result == "shadow_terminating":
+        # 重复操作: 终止已受理, 返回当前状态
+        return {"id": rid, "accepted": True, "status": "terminating",
+                "result": result}
+    if (result not in FINALIZE_FROZEN
+            and not ctx.shadow_done
+            and ctx.shadow_task is not None
+            and not ctx.shadow_task.done()):
+        # 影子在途: 受理终止。先落"终止中", 再取消影子任务;
+        # "已终止"与名额归还由影子任务在实际退出时完成
+        ctx.terminate_requested = True
+        rec["result"] = "shadow_terminating"
+        rec["shadow"] = "terminating (operator)"
+        ctx.shadow_task.cancel()
+        return {"id": rid, "accepted": True, "status": "terminating",
+                "result": rec["result"]}
+    # 影子已退出或已有定性结论: 保留原结论, 返回当前状态
+    return {"id": rid, "accepted": False, "status": "current",
+            "result": result}
 
 
 # 报价相关 GET 请求走代理; 网页与管理 API 不拦截

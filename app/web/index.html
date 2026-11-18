@@ -53,9 +53,16 @@
   .pill.mismatch { background:#fee2e2; color:var(--bad); }
   .pill.shadow_timeout,.pill.shadow_error { background:#fef3c7; color:var(--warn); }
   .pill.shadow_skipped_no_slot { background:#e0e7ff; color:#3730a3; }
+  .pill.shadow_terminating { background:#fef9c3; color:#854d0e; }
+  .pill.shadow_terminated { background:#e2e8f0; color:#334155; }
   .pill.client_disconnected,.pill.primary_error,.pill.primary_incomplete,
   .pill.shadow_pending {
           background:#f1f5f9; color:#475569; }
+  .btn-term { padding:2px 10px; font-size:11px; font-weight:600;
+          border-radius:6px; background:#fff7ed; color:#9a3412;
+          border:1px solid #fdba74; }
+  .btn-term:hover:not(:disabled) { background:#ffedd5; }
+  .btn-term:disabled { opacity:.55; cursor:not-allowed; }
   .mono { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
   .records-wrap { max-height:520px; overflow:auto; }
   .grid2 { display:grid; grid-template-rows:auto auto; gap:16px; }
@@ -105,7 +112,8 @@
     </div>
     <p class="hint">
       网关固定并行调用主端与影子端；客户端只收主端原始字节。影子
-      2 秒硬超时、最多 4 个并发，满额跳过并在记录中注明。
+      2 秒硬超时、最多 4 个并发，满额跳过并在记录中注明。主端已送达而影子仍在途的
+      待定记录，可在下方记录表点"终止影子"取消影子并归还名额，主响应不受影响。
     </p>
   </section>
 
@@ -125,7 +133,7 @@
       <div class="records-wrap">
         <table>
           <thead><tr>
-            <th>#</th><th>目标</th><th>结果</th><th>主端</th><th>影子</th><th>摘要 / 原因</th>
+            <th>#</th><th>目标</th><th>结果</th><th>主端</th><th>影子</th><th>摘要 / 原因</th><th>操作</th>
           </tr></thead>
           <tbody id="records"></tbody>
         </table>
@@ -236,10 +244,34 @@ const RESULT_TEXT = {
   shadow_error: '影子失败', shadow_skipped_no_slot: '影子跳过(名额满)',
   client_disconnected: '客户端断连', primary_error: '主端失败',
   primary_incomplete: '主端不完整', shadow_completed_primary_incomplete: '主端未完成',
-  shadow_pending: '影子进行中',
+  shadow_pending: '影子进行中', shadow_terminating: '影子终止中',
+  shadow_terminated: '影子已终止',
 };
 
 function shortHash(h) { return h ? h.slice(0, 10) + '…' : '—'; }
+
+function opCell(r) {
+  if (r.result === 'shadow_pending') {
+    return `<button class="btn-term" data-rid="${escapeHtml(r.id)}">终止影子</button>`;
+  }
+  if (r.result === 'shadow_terminating') {
+    return '<button class="btn-term" disabled>终止中…</button>';
+  }
+  return '<span style="color:var(--mut)">—</span>';
+}
+
+// 终止影子: 只取消对应影子调用, 主响应与其他请求不受影响
+$('records').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button.btn-term');
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = '终止中…';
+  try {
+    await fetch(`/api/records/${encodeURIComponent(btn.dataset.rid)}/terminate-shadow`,
+                { method: 'POST' });
+  } catch (err) { /* 网关不可达时由下一次轮询恢复显示 */ }
+  await loadRecords();
+});
 
 async function loadRecords() {
   try {
@@ -264,6 +296,7 @@ async function loadRecords() {
         <td>${primary}</td>
         <td>${shadow}</td>
         <td class="mono">${escapeHtml(reason)}</td>
+        <td>${opCell(r)}</td>
       </tr>`;
     }).join('');
   } catch (e) {
